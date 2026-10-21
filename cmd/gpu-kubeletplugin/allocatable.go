@@ -102,6 +102,22 @@ func (d *AllocatableDevice) MemoryBytes() uint64 {
 	return 0
 }
 
+// ComputeUnits returns the device's total compute-unit count (the whole
+// device). Per-claim CU budgets come from the allocation result's
+// ConsumedCapacity["computeUnits"] when present (see cuMaskFromCapacity in
+// runtime_edits.go); this is the fallback (whole device) when none is recorded.
+func (d *AllocatableDevice) ComputeUnits() uint64 {
+	switch d.Type() {
+	case consts.AmdGpuDeviceType:
+		return uint64(d.AmdGpu.ComputeUnits)
+	case consts.AmdPartitionDeviceType:
+		return uint64(d.AmdPartition.ComputeUnits)
+	case consts.SyntheticPartitionDeviceType:
+		return uint64(d.SyntheticPartition.ComputeUnits)
+	}
+	return 0
+}
+
 // GetDevice returns the DRA Device representation for Kubernetes
 func (d *AllocatableDevice) GetDevice() resourceapi.Device {
 	switch d.Type() {

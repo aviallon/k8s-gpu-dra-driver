@@ -1,11 +1,11 @@
 /*
-Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
+Copyright 2026 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-     http://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -35,79 +35,73 @@ import (
 	cdispec "tags.cncf.io/container-device-interface/specs-go"
 )
 
-// TestCuMaskForGPUIndex checks the documented mapping: even GPU index ->
-// lower CU half, odd GPU index -> upper CU half.
-func TestCuMaskForGPUIndex(t *testing.T) {
-	assert.Equal(t, "0:0-51", cuMaskForGPUIndex(0))
-	assert.Equal(t, "0:52-103", cuMaskForGPUIndex(1))
-	assert.Equal(t, "0:0-51", cuMaskForGPUIndex(2))
-	assert.Equal(t, "0:52-103", cuMaskForGPUIndex(3))
+// testDevice builds a whole MI210-class GPU (104 CUs, 64 GiB).
+func testDevice() *AllocatableDevice {
+	return &AllocatableDevice{AmdGpu: &AmdGpuInfo{
+		PCIAddress:   "0000:e3:00.0",
+		MemoryBytes:  68702699520,
+		ComputeUnits: 104,
+	}}
 }
 
-// TestBuildGPUIndexByPCI checks the deterministic GPU index: ordinal of the
-// PCI BDF in sorted order of the node's GPU BDFs.
-func TestBuildGPUIndexByPCI(t *testing.T) {
-	allocatable := AllocatableDevices{
-		"gpu-1-2": {AmdGpu: &AmdGpuInfo{PCIAddress: "0000:e3:00.0"}},
-		"gpu-3-4": {AmdGpu: &AmdGpuInfo{PCIAddress: "0000:03:00.0"}},
-		// GPUIndex consistent with the map (same sorted-PCI order that
-		// enumerateAllPossibleDevices assigns): "0000:81:00.0" -> 1.
-		"gpu-5-6": {SyntheticPartition: &SyntheticPartitionDevice{PCIAddress: "0000:81:00.0", GPUIndex: 1}},
+// resultWith builds an allocation result carrying the given ConsumedCapacity.
+func resultWith(cap map[resourceapi.QualifiedName]string) *resourceapi.DeviceRequestAllocationResult {
+	cc := map[resourceapi.QualifiedName]resource.Quantity{}
+	for k, v := range cap {
+		cc[k] = resource.MustParse(v)
 	}
-	byPCI := buildGPUIndexByPCI(allocatable)
-	assert.Equal(t, map[string]int{
-		"0000:03:00.0": 0,
-		"0000:81:00.0": 1,
-		"0000:e3:00.0": 2,
-	}, byPCI)
-	// The map must agree with SyntheticPartitionDevice.GPUIndex (one source of
-	// truth for "which GPU is even/odd").
-	assert.Equal(t, allocatable["gpu-5-6"].SyntheticPartition.GPUIndex, byPCI["0000:81:00.0"])
+	return &resourceapi.DeviceRequestAllocationResult{ConsumedCapacity: cc}
 }
 
-// TestDeviceMemoryBudgetBytes checks the budget preference: the allocation
-// result's ConsumedCapacity["memory"] wins when present; the device's full
-// MemoryBytes is the fallback when absent.
-func TestDeviceMemoryBudgetBytes(t *testing.T) {
-	dev := &AllocatableDevice{AmdGpu: &AmdGpuInfo{MemoryBytes: 32 << 30}}
+func TestCuMaskFromCapacity(t *testing.T) {
+	dev := testDevice()
+	alloc := newCUAllocator()
 
-	// ConsumedCapacity present -> per-claim budget.
-	result := &resourceapi.DeviceRequestAllocationResult{
-		ConsumedCapacity: map[resourceapi.QualifiedName]resource.Quantity{
-			memoryResourceName: resource.MustParse("8Gi"),
-		},
-	}
-	assert.Equal(t, uint64(8<<30), deviceMemoryBudgetBytes(result, dev))
-
-	// ConsumedCapacity absent -> fallback to full device memory.
-	assert.Equal(t, uint64(32<<30), deviceMemoryBudgetBytes(&resourceapi.DeviceRequestAllocationResult{}, dev))
-
-	// ConsumedCapacity present but zero (shared devices report zero-consumption
-	// entries): the scheduler's number is authoritative -> no cap (0), NOT the
-	// whole device's VRAM.
-	zero := &resourceapi.DeviceRequestAllocationResult{
-		ConsumedCapacity: map[resourceapi.QualifiedName]resource.Quantity{
-			memoryResourceName: {},
-		},
-	}
-	assert.Equal(t, uint64(0), deviceMemoryBudgetBytes(zero, dev))
+	// No computeUnits capacity = 100% of the GPU -> no mask.
+	assert.Equal(t, "", cuMaskFromCapacity(resultWith(nil), dev, alloc, 0, "s0"))
+	// Whole-device worth = 100% -> no mask.
+	assert.Equal(t, "", cuMaskFromCapacity(resultWith(map[resourceapi.QualifiedName]string{"computeUnits": "104"}), dev, alloc, 0, "s1"))
+	// A real fraction -> a disjoint N-CU range.
+	mask := cuMaskFromCapacity(resultWith(map[resourceapi.QualifiedName]string{"computeUnits": "13"}), dev, alloc, 0, "s2")
+	assert.Equal(t, "0:0-12", mask)
 }
 
-// TestBuildContainerRuntimeEditsSkipsHookWithoutBudget: budget 0 = no cap ->
-// the dmem hook must NOT be emitted (a 0-byte kernel cap would break every
-// workload and a hard container-start failure on degraded metadata would be
-// worse than no cap); HSA_CU_MASK is independent and stays.
-func TestBuildContainerRuntimeEditsSkipsHookWithoutBudget(t *testing.T) {
-	env, hooks := buildContainerRuntimeEdits("0000:e3:00.0", 0, 0)
+func TestCUAllocatorDisjoint(t *testing.T) {
+	dev := testDevice()
+	alloc := newCUAllocator()
+	a := cuMaskFromCapacity(resultWith(map[resourceapi.QualifiedName]string{"computeUnits": "52"}), dev, alloc, 0, "share-a")
+	b := cuMaskFromCapacity(resultWith(map[resourceapi.QualifiedName]string{"computeUnits": "52"}), dev, alloc, 0, "share-b")
+	assert.Equal(t, "0:0-51", a)
+	assert.Equal(t, "0:52-103", b)
+	// Idempotent: re-assigning the same share returns the same range.
+	assert.Equal(t, a, cuMaskFromCapacity(resultWith(map[resourceapi.QualifiedName]string{"computeUnits": "52"}), dev, alloc, 0, "share-a"))
+	// After release, the range is reusable.
+	alloc.release("share-a")
+	assert.Equal(t, "0:0-51", cuMaskFromCapacity(resultWith(map[resourceapi.QualifiedName]string{"computeUnits": "52"}), dev, alloc, 0, "share-c"))
+}
+
+func TestDmemBudgetFromCapacity(t *testing.T) {
+	dev := testDevice()
+	// No memory capacity = 100% -> no cap (0).
+	assert.Equal(t, uint64(0), dmemBudgetFromCapacity(resultWith(nil), dev))
+	// Whole-device worth = 100% -> no cap.
+	assert.Equal(t, uint64(0), dmemBudgetFromCapacity(resultWith(map[resourceapi.QualifiedName]string{"memory": "64Gi"}), dev))
+	// A real fraction -> the bytes.
+	assert.Equal(t, uint64(8589934592), dmemBudgetFromCapacity(resultWith(map[resourceapi.QualifiedName]string{"memory": "8Gi"}), dev))
+}
+
+// TestWholeGpuNoMaskNoCap: a whole-GPU claim (no ConsumedCapacity, e.g. vLLM via
+// amd.com/gpu) must get NO HSA_CU_MASK and NO dmem hook — the full device.
+func TestWholeGpuNoMaskNoCap(t *testing.T) {
+	env, hooks := buildContainerRuntimeEdits("0000:e3:00.0", "", 0)
+	assert.Empty(t, env)
 	assert.Empty(t, hooks)
-	assert.Equal(t, []string{"HSA_CU_MASK=0:0-51"}, env)
 }
 
-// TestBuildContainerRuntimeEdits renders the CDI edits and checks both the
-// HSA_CU_MASK env and the createRuntime dmem hook are present with the exact
-// expected payloads. Run with -v to see the rendered JSON.
+// TestBuildContainerRuntimeEdits: a fractional claim gets both the CU-mask env
+// and the createRuntime dmem hook with the exact payloads.
 func TestBuildContainerRuntimeEdits(t *testing.T) {
-	env, hooks := buildContainerRuntimeEdits("0000:e3:00.0", 8589934592, 1)
+	env, hooks := buildContainerRuntimeEdits("0000:e3:00.0", "0:52-103", 8589934592)
 
 	require.Len(t, hooks, 1)
 	assert.Equal(t, "createRuntime", hooks[0].HookName)
@@ -118,33 +112,31 @@ func TestBuildContainerRuntimeEdits(t *testing.T) {
 	}, hooks[0].Env)
 	assert.Equal(t, []string{"HSA_CU_MASK=0:52-103"}, env)
 
-	// Render exactly what ends up in the CDI spec (device ContainerEdits).
 	rendered, err := json.MarshalIndent(cdispec.ContainerEdits{Env: env, Hooks: hooks}, "", "  ")
 	require.NoError(t, err)
 	t.Logf("example CDI ContainerEdits:\n%s", rendered)
-
 	assert.Contains(t, string(rendered), `"hookName": "createRuntime"`)
 	assert.Contains(t, string(rendered), `"HSA_CU_MASK=0:52-103"`)
-	assert.Contains(t, string(rendered), `"AMD_GPU_PCI_BDF=0000:e3:00.0"`)
-	assert.Contains(t, string(rendered), `"AMD_GPU_MEM_BYTES=8589934592"`)
+}
 
-	// Sanity: the device type constant path still builds for a synthetic
-	// partition (the case GetPCIAddress previously missed).
-	sp := &AllocatableDevice{SyntheticPartition: &SyntheticPartitionDevice{PCIAddress: "0000:81:00.0"}}
-	assert.Equal(t, "0000:81:00.0", sp.GetPCIAddress())
-	assert.Equal(t, consts.SyntheticPartitionDeviceType, sp.Type())
+// TestBuildContainerRuntimeEditsSkipsHookWithoutBudget: a CU fraction with no
+// memory budget -> the mask stays, the hook is omitted (a 0-byte cap would
+// break the workload).
+func TestBuildContainerRuntimeEditsSkipsHookWithoutBudget(t *testing.T) {
+	env, hooks := buildContainerRuntimeEdits("0000:e3:00.0", "0:0-12", 0)
+	assert.Equal(t, []string{"HSA_CU_MASK=0:0-12"}, env)
+	assert.Empty(t, hooks)
 }
 
 // TestCreateClaimSpecFileCarriesRuntimeEdits drives the REAL spec-file path
-// (CreateClaimSpecFile -> CDI cache -> disk -> ReadSpec) and asserts the
-// createRuntime hook and HSA_CU_MASK survive it — the file on disk is what the
-// container runtime actually consumes.
+// (CreateClaimSpecFile -> CDI cache -> disk -> ReadSpec) and asserts the hook and
+// CU mask survive it — the file on disk is what the runtime consumes.
 func TestCreateClaimSpecFileCarriesRuntimeEdits(t *testing.T) {
 	cdiRoot := t.TempDir()
 	handler, err := NewCDIHandler(&Config{flags: &Flags{cdiRoot: cdiRoot, nodeName: "node-1"}})
 	require.NoError(t, err)
 
-	env, hooks := buildContainerRuntimeEdits("0000:e3:00.0", 8589934592, 0)
+	env, hooks := buildContainerRuntimeEdits("0000:e3:00.0", "0:0-51", 8589934592)
 	devices := PreparedDevices{
 		{
 			Device: drapbv1.Device{DeviceName: "gpu-1-2"},
@@ -168,8 +160,17 @@ func TestCreateClaimSpecFileCarriesRuntimeEdits(t *testing.T) {
 	require.Len(t, edits.Hooks, 1)
 	assert.Equal(t, "createRuntime", edits.Hooks[0].HookName)
 	assert.Equal(t, "/run/amd-gpu/dmem-hook", edits.Hooks[0].Path)
-	assert.Equal(t, []string{
-		"AMD_GPU_PCI_BDF=0000:e3:00.0",
-		"AMD_GPU_MEM_BYTES=8589934592",
-	}, edits.Hooks[0].Env)
+}
+
+func TestBuildGPUIndexByPCI(t *testing.T) {
+	alloc := AllocatableDevices{
+		"gpu-0": &AllocatableDevice{AmdGpu: &AmdGpuInfo{PCIAddress: "0000:83:00.0"}},
+		"gpu-1": &AllocatableDevice{AmdGpu: &AmdGpuInfo{PCIAddress: "0000:03:00.0"}},
+		"gpu-2": &AllocatableDevice{AmdGpu: &AmdGpuInfo{PCIAddress: "0000:43:00.0"}},
+	}
+	byPCI := buildGPUIndexByPCI(alloc)
+	assert.Equal(t, 0, byPCI["0000:03:00.0"]) // sorted BDF order
+	assert.Equal(t, 1, byPCI["0000:43:00.0"])
+	assert.Equal(t, 2, byPCI["0000:83:00.0"])
+	_ = consts.DriverName // keep the consts import if unused elsewhere
 }

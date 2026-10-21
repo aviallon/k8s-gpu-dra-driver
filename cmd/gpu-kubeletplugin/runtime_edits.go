@@ -22,6 +22,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
 
 	resourceapi "k8s.io/api/resource/v1"
 	klog "k8s.io/klog/v2"
@@ -59,39 +60,163 @@ const (
 	// hsaCuMaskEnv is the ROCm runtime env var selecting compute units.
 	hsaCuMaskEnv = "HSA_CU_MASK"
 
-	// totalCUs is the CU count the 52-CU split is defined over (104 CUs, e.g.
-	// MI210-class ASICs; MI300X-class XCDs have a different count). The
-	// prescribed rule is a 52-CU half of 104; ASICs with other CU counts need
-	// per-device derivation (from AmdGpuInfo.ComputeUnits) — see the report.
-	totalCUs = 104
-	// cuHalf splits the CUs into two disjoint halves of 52.
-	cuHalf = totalCUs / 2
-
-	// memoryResourceName is the ConsumedCapacity key the scheduler records for
-	// VRAM (matches the "memory" device capacity in deviceinfo.go).
-	memoryResourceName resourceapi.QualifiedName = "memory"
+	// memoryResourceName / computeUnitsResourceName are the ConsumedCapacity
+	// keys the scheduler records for VRAM / compute units (matching the device
+	// capacities in deviceinfo.go). They drive the dmem cap and the CU mask.
+	memoryResourceName       resourceapi.QualifiedName = "memory"
+	computeUnitsResourceName resourceapi.QualifiedName = "computeUnits"
 )
 
-// cuMaskForGPUIndex returns the HSA_CU_MASK value that confines a container to
-// one disjoint 52-CU half of the GPU's 104 CUs.
-//
-// Mapping rule (deterministic per GPU):
-//
-//	gpuIndex even -> "0:0-51"    (lower half: CUs 0-51)
-//	gpuIndex odd  -> "0:52-103"  (upper half: CUs 52-103)
-//
-// where gpuIndex is the GPU's ordinal among the node's GPU PCI addresses in
-// sorted BDF order (see buildGPUIndexByPCI). The halves are disjoint BETWEEN
-// GPUs; two shares of the SAME GPU resolve to the same GPU index and therefore
-// receive the same half (the rule is per-GPU by design — see the report's
-// known-limitations section). The leading "0:" prefix follows the prescribed
-// <idx>:<lo>-<hi> format (verify against the pinned ROCm runtime before merge
-// — see report).
-func cuMaskForGPUIndex(gpuIndex int) string {
-	if gpuIndex%2 == 0 {
-		return fmt.Sprintf("0:0-%d", cuHalf-1)
+// cuAssignment records one share's disjoint CU range on a GPU.
+type cuAssignment struct {
+	gpuIndex int
+	lo, hi   int // inclusive CU range
+}
+
+// cuAllocator hands out disjoint compute-unit ranges to the shares of each GPU
+// so two pods sharing one GPU never run on the same CUs. Ranges are contiguous
+// (HSA_CU_MASK <idx>:<lo>-<hi>) and are released on Unprepare via the share key.
+type cuAllocator struct {
+	mu      sync.Mutex
+	used    map[int][]bool // gpuIndex -> used[cu]
+	byShare map[string]cuAssignment
+}
+
+func newCUAllocator() *cuAllocator {
+	return &cuAllocator{used: map[int][]bool{}, byShare: map[string]cuAssignment{}}
+}
+
+// assign reserves n disjoint CUs on gpuIndex for shareKey and returns the
+// inclusive range. Idempotent: re-assigning the same share returns its range.
+// ok=false when the GPU has no free contiguous block of n CUs left.
+func (a *cuAllocator) assign(gpuIndex, totalCUs, n int, shareKey string) (lo, hi int, ok bool) {
+	if a == nil {
+		return 0, 0, false
 	}
-	return fmt.Sprintf("0:%d-%d", cuHalf, totalCUs-1)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if as, exists := a.byShare[shareKey]; exists {
+		return as.lo, as.hi, true
+	}
+	used := a.used[gpuIndex]
+	if len(used) < totalCUs {
+		used = append(used, make([]bool, totalCUs-len(used))...)
+		a.used[gpuIndex] = used
+	}
+	for lo = 0; lo+n <= totalCUs; lo++ {
+		free := true
+		for i := lo; i < lo+n; i++ {
+			if used[i] {
+				free = false
+				break
+			}
+		}
+		if free {
+			for i := lo; i < lo+n; i++ {
+				used[i] = true
+			}
+			a.byShare[shareKey] = cuAssignment{gpuIndex: gpuIndex, lo: lo, hi: lo + n - 1}
+			return lo, lo + n - 1, true
+		}
+	}
+	return 0, 0, false
+}
+
+// release frees shareKey's CU range so it can be reused by a later share.
+func (a *cuAllocator) release(shareKey string) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	as, ok := a.byShare[shareKey]
+	if !ok {
+		return
+	}
+	if used := a.used[as.gpuIndex]; as.lo < len(used) {
+		for i := as.lo; i <= as.hi && i < len(used); i++ {
+			used[i] = false
+		}
+	}
+	delete(a.byShare, shareKey)
+}
+
+// cuMaskFromCapacity derives the HSA_CU_MASK for a claim from its DRA
+// ConsumedCapacity["computeUnits"] — the mask reflects what the scheduler
+// actually allocated:
+//   - no computeUnits capacity (or the whole device's worth) = 100% of the GPU
+//     -> NO mask (the container sees every CU);
+//   - a real fraction (0 < N < the device's CUs) -> a disjoint N-CU range from
+//     alloc (so shares of one GPU never overlap).
+//
+// Mask format "<idx>:<lo>-<hi>" (idx = ROCm device ordinal; 0 on a container
+// granted a single GPU).
+func cuMaskFromCapacity(result *resourceapi.DeviceRequestAllocationResult, dev *AllocatableDevice, alloc *cuAllocator, gpuIndex int, shareKey string) string {
+	if result == nil || dev == nil {
+		return ""
+	}
+	totalCUs := int(dev.ComputeUnits())
+	qty, ok := result.ConsumedCapacity[computeUnitsResourceName]
+	if !ok {
+		return "" // no capacity = 100% of the GPU
+	}
+	n := int(qty.Value())
+	if n <= 0 || totalCUs <= 0 || n >= totalCUs {
+		return "" // 100% (or unusable) = no mask
+	}
+	lo, hi, ok := alloc.assign(gpuIndex, totalCUs, n, shareKey)
+	if !ok {
+		klog.Errorf("no free %d-CU block on GPU %d for share %s; HSA_CU_MASK omitted", n, gpuIndex, shareKey)
+		return ""
+	}
+	return fmt.Sprintf("0:%d-%d", lo, hi)
+}
+
+// dmemBudgetFromCapacity returns the claim's VRAM cap from
+// ConsumedCapacity["memory"]: a real fraction (0 < M < the device's VRAM)
+// returns the bytes; no capacity (or the whole device, or an explicit zero)
+// returns 0 = "no cap" (no dmem hook) = 100% of the GPU.
+func dmemBudgetFromCapacity(result *resourceapi.DeviceRequestAllocationResult, dev *AllocatableDevice) uint64 {
+	if result == nil || dev == nil {
+		return 0
+	}
+	qty, ok := result.ConsumedCapacity[memoryResourceName]
+	if !ok {
+		return 0 // no capacity = 100% of the GPU, no cap
+	}
+	v := qty.Value()
+	if v <= 0 || uint64(v) >= dev.MemoryBytes() {
+		return 0 // whole-device (or explicit zero) = no cap
+	}
+	return uint64(v)
+}
+
+// buildContainerRuntimeEdits returns the per-device Env and Hooks for a claim's
+// CDI edits, both derived from its DRA ConsumedCapacity:
+//   - Env HSA_CU_MASK: only when a CU fraction is requested (100% = no mask).
+//   - Hooks createRuntime: writes the dmem VRAM cap, only when a memory
+//     fraction is requested (100% = no hook).
+//
+// Whole-GPU claims (e.g. vLLM via amd.com/gpu, no capacity) get neither, so the
+// full device is untouched.
+func buildContainerRuntimeEdits(pciBDF, cuMask string, memBudgetBytes uint64) (env []string, hooks []*cdispec.Hook) {
+	if cuMask != "" {
+		env = []string{fmt.Sprintf("%s=%s", hsaCuMaskEnv, cuMask)}
+	}
+	if memBudgetBytes == 0 {
+		return env, nil
+	}
+	hooks = []*cdispec.Hook{
+		{
+			HookName: "createRuntime",
+			Path:     dmemHookInstallPath,
+			Env: []string{
+				fmt.Sprintf("%s=%s", hookEnvPCIBDF, pciBDF),
+				fmt.Sprintf("%s=%d", hookEnvMemBytes, memBudgetBytes),
+			},
+		},
+	}
+	return env, hooks
 }
 
 // buildGPUIndexByPCI maps every allocatable device's PCI BDF to its GPU index:
@@ -112,71 +237,6 @@ func buildGPUIndexByPCI(allocatable AllocatableDevices) map[string]int {
 		byPCI[bdf] = i
 	}
 	return byPCI
-}
-
-// deviceMemoryBudgetBytes returns this claim's VRAM budget for the device in
-// bytes, or 0 when no meaningful cap can be derived ("no cap").
-//
-// Preference order:
-//  1. the allocation result's ConsumedCapacity["memory"] when the key is
-//     present — the scheduler's number is authoritative, EVEN when it is zero
-//     (shared devices report zero-consumption entries); an explicit zero must
-//     NOT silently inflate to the whole device's VRAM;
-//  2. otherwise the device's full MemoryBytes.
-//
-// A return of 0 means "no cap": buildContainerRuntimeEdits emits no dmem hook
-// for it (a 0-byte cap would break every workload), and applyConfig logs it.
-func deviceMemoryBudgetBytes(result *resourceapi.DeviceRequestAllocationResult, dev *AllocatableDevice) uint64 {
-	if result != nil {
-		if qty, ok := result.ConsumedCapacity[memoryResourceName]; ok {
-			if v := qty.Value(); v > 0 {
-				return uint64(v)
-			}
-			// Present but zero/negative: explicitly no budget.
-			return 0
-		}
-	}
-	if dev != nil {
-		return dev.MemoryBytes()
-	}
-	return 0
-}
-
-// buildContainerRuntimeEdits returns the per-device Env and Hooks every
-// allocated GPU device's CDI edits carry:
-//
-//   - Env: HSA_CU_MASK=<idx>:<lo>-<hi> selecting a disjoint CU half.
-//   - Hooks: a createRuntime hook that runs dmem-hook on the host with the
-//     GPU's BDF and the claim's VRAM budget; the hook writes
-//     "drm/<bdf>/vram <bytes>" to dmem.max on the pod's cgroup so the kernel
-//     enforces the cap for the pod's whole lifetime.
-//
-// When memBudgetBytes is 0 ("no cap": consumedCapacity explicitly zero or
-// VRAM unreadable at discovery) no hook is emitted — a 0-byte kernel cap
-// would break every workload, and a hard container-start failure on degraded
-// metadata would be worse than no cap. The HSA_CU_MASK env is independent and
-// always emitted. Callers log when this happens (never silent).
-func buildContainerRuntimeEdits(pciBDF string, memBudgetBytes uint64, gpuIndex int) (env []string, hooks []*cdispec.Hook) {
-	env = []string{
-		fmt.Sprintf("%s=%s", hsaCuMaskEnv, cuMaskForGPUIndex(gpuIndex)),
-	}
-	if memBudgetBytes == 0 {
-		return env, nil
-	}
-	hooks = []*cdispec.Hook{
-		{
-			// "createRuntime" is the CDI hook name the CDI library translates
-			// into an OCI createRuntime hook: it runs after the container is
-			// created (pod cgroup exists) and before it starts.
-			HookName: "createRuntime",
-			Path:     dmemHookInstallPath,
-			Env: []string{
-				fmt.Sprintf("%s=%s", hookEnvPCIBDF, pciBDF),
-				fmt.Sprintf("%s=%d", hookEnvMemBytes, memBudgetBytes),
-			},
-		},
-	}
-	return env, hooks
 }
 
 // checkDmemPrereqs logs loud, early warnings when the node is not ready for
