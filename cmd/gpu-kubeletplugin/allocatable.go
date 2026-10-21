@@ -78,8 +78,28 @@ func (d *AllocatableDevice) GetPCIAddress() string {
 		return d.AmdPartition.Parent.PCIAddress
 	case consts.VfioDeviceType:
 		return d.Vfio.PCIAddress
+	case consts.SyntheticPartitionDeviceType:
+		return d.SyntheticPartition.PCIAddress
 	}
 	return ""
+}
+
+// MemoryBytes returns the device's VRAM budget fallback in bytes (the whole
+// device's MemoryBytes). Per-claim budgets come from the allocation result's
+// ConsumedCapacity when present (see deviceMemoryBudgetBytes in
+// runtime_edits.go); this is the fallback when the scheduler consumed none.
+func (d *AllocatableDevice) MemoryBytes() uint64 {
+	switch d.Type() {
+	case consts.AmdGpuDeviceType:
+		return d.AmdGpu.MemoryBytes
+	case consts.AmdPartitionDeviceType:
+		return d.AmdPartition.MemoryBytes
+	case consts.SyntheticPartitionDeviceType:
+		return d.SyntheticPartition.MemoryBytes
+	}
+	// VFIO passthrough devices have no amdgpu VRAM budget (the whole device is
+	// handed over); 0 is correct there and the caller treats 0 as "no cap".
+	return 0
 }
 
 // GetDevice returns the DRA Device representation for Kubernetes

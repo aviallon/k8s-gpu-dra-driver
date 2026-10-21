@@ -99,9 +99,10 @@ type DeviceState struct {
 	vfioManager          *VfioPciManager
 	claimVfioConversions map[string]*AmdGpuInfo
 	partitionState       *PartitionState
-	driver               *driver // back-reference for re-publishing resources
-	syntheticPartition   bool    // whether synthetic-partition mode is enabled
-	nodeName             string  // this node's name, matched against allocation results' Pool
+	gpuIndexByPCI        map[string]int // PCI BDF -> deterministic GPU index (see buildGPUIndexByPCI)
+	driver               *driver        // back-reference for re-publishing resources
+	syntheticPartition   bool           // whether synthetic-partition mode is enabled
+	nodeName             string         // this node's name, matched against allocation results' Pool
 }
 
 func NewDeviceState(config *Config) (*DeviceState, error) {
@@ -144,6 +145,7 @@ func NewDeviceState(config *Config) (*DeviceState, error) {
 	state := &DeviceState{
 		cdi:                cdi,
 		allocatable:        allocatable,
+		gpuIndexByPCI:      buildGPUIndexByPCI(allocatable),
 		vfioManager:        vfioMgr,
 		checkpointManager:  checkpointManager,
 		syntheticPartition: autoPartition,
@@ -163,6 +165,9 @@ func NewDeviceState(config *Config) (*DeviceState, error) {
 		}
 		state.partitionState = NewPartitionState(gpuPCIAddresses, partitionableGPUs, allocatable, kmmEnabled, recoverer)
 	}
+
+	// Surface dmem-capability problems once at startup, not per pod.
+	checkDmemPrereqs()
 
 	checkpoints, err := state.checkpointManager.ListCheckpoints()
 	if err != nil {
@@ -793,7 +798,21 @@ func (s *DeviceState) applyConfig(claimUID string, config *configapi.GpuConfig, 
 		//	// TODO implement space partitioning config when it is available
 		//}
 
-		edits, err := s.buildDeviceCDIEdits(card, renderD)
+		// The CDI edits also carry the per-device runtime quota: HSA_CU_MASK and
+		// the createRuntime dmem hook. Both need the physical GPU's PCI BDF and
+		// this claim's VRAM budget, threaded in here from the allocation result.
+		pciBDF := device.GetPCIAddress()
+		if pciBDF == "" {
+			return nil, fmt.Errorf("no PCI address for device %s; cannot build dmem/CU-mask edits", result.Device)
+		}
+		memBudgetBytes := deviceMemoryBudgetBytes(result, device)
+		if memBudgetBytes == 0 {
+			// Loud, not silent: no dmem hook will be emitted for this device.
+			klog.Warningf("no dmem VRAM cap for device %s (claim %s): memory budget is 0 (consumedCapacity/memory explicitly zero, or VRAM unreadable at discovery); only HSA_CU_MASK is emitted",
+				result.Device, claimUID)
+		}
+
+		edits, err := s.buildDeviceCDIEdits(card, renderD, pciBDF, memBudgetBytes)
 		if err != nil {
 			return nil, fmt.Errorf("error building CDI edits for device %s (card=%d, renderD=%d): %w",
 				result.Device, card, renderD, err)
@@ -806,7 +825,19 @@ func (s *DeviceState) applyConfig(claimUID string, config *configapi.GpuConfig, 
 }
 
 // buildDeviceCDIEdits creates CDI container edits for a specific card/renderD pair.
-func (s *DeviceState) buildDeviceCDIEdits(card, renderD int) (*cdispec.ContainerEdits, error) {
+//
+// Beyond the device nodes, every GPU device's edits gain the runtime quota
+// machinery (see runtime_edits.go):
+//   - Env HSA_CU_MASK: confines the workload to a disjoint 52-CU half of the
+//     GPU's CUs (deterministic per GPU; the halves are disjoint BETWEEN GPUs —
+//     shares of one GPU receive the same half, see runtime_edits.go).
+//   - Hooks createRuntime: runs /opt/amd-gpu/dmem-hook on the host at
+//     container creation with this GPU's BDF and the claim's VRAM budget; the
+//     hook writes "drm/<bdf>/vram <bytes>" to dmem.max on the POD's cgroup so
+//     the kernel enforces the VRAM cap for the pod's whole lifetime. Emitted
+//     only when a meaningful budget exists (budget 0 = no cap, and the caller
+//     has logged why).
+func (s *DeviceState) buildDeviceCDIEdits(card, renderD int, pciBDF string, memBudgetBytes uint64) (*cdispec.ContainerEdits, error) {
 	cardPath := fmt.Sprintf("/dev/dri/card%d", card)
 	renderDPath := fmt.Sprintf("/dev/dri/renderD%d", renderD)
 	kfdPath := "/dev/kfd"
@@ -823,6 +854,12 @@ func (s *DeviceState) buildDeviceCDIEdits(card, renderD int) (*cdispec.Container
 	if err != nil {
 		return nil, fmt.Errorf("error getting device attrs for %s: %w", kfdPath, err)
 	}
+
+	gpuIndex, ok := s.gpuIndexByPCI[pciBDF]
+	if !ok {
+		return nil, fmt.Errorf("no GPU index known for PCI address %s; cannot derive HSA_CU_MASK", pciBDF)
+	}
+	env, hooks := buildContainerRuntimeEdits(pciBDF, memBudgetBytes, gpuIndex)
 
 	return &cdispec.ContainerEdits{
 		DeviceNodes: []*cdispec.DeviceNode{
@@ -851,6 +888,11 @@ func (s *DeviceState) buildDeviceCDIEdits(card, renderD int) (*cdispec.Container
 				Permissions: renderDPermission,
 			},
 		},
+		// HSA_CU_MASK: disjoint CU half per GPU (why: see buildDeviceCDIEdits doc).
+		Env: env,
+		// createRuntime dmem hook: kernel VRAM cap on the pod cgroup (why: see
+		// buildDeviceCDIEdits doc).
+		Hooks: hooks,
 	}, nil
 }
 
