@@ -92,6 +92,7 @@ func (d *AmdGpuInfo) GetDevice() resourceapi.Device {
 	memFull := *resource.NewQuantity(int64(d.MemoryBytes), resource.BinarySI)
 	cuFull := *resource.NewQuantity(int64(d.ComputeUnits), resource.DecimalSI)
 	oneGi := *resource.NewQuantity(1<<30, resource.BinarySI)
+	oneMi := *resource.NewQuantity(1<<20, resource.BinarySI)
 	one := *resource.NewQuantity(1, resource.DecimalSI)
 	return resourceapi.Device{
 		Name:       d.CanonicalName(),
@@ -108,7 +109,7 @@ func (d *AmdGpuInfo) GetDevice() resourceapi.Device {
 				Value: memFull,
 				RequestPolicy: &resourceapi.CapacityRequestPolicy{
 					Default:    &memFull,
-					ValidRange: &resourceapi.CapacityRequestPolicyRange{Min: &oneGi, Max: &memFull, Step: &oneGi},
+					ValidRange: &resourceapi.CapacityRequestPolicyRange{Min: &oneGi, Max: &memFull, Step: &oneMi},
 				},
 			},
 			"computeUnits": {
