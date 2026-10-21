@@ -17,9 +17,11 @@ limitations under the License.
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"maps"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -42,14 +44,15 @@ import (
 //     that moment, so without the hook the pod has no VRAM quota and a
 //     workload can exhaust the whole device's VRAM.
 const (
-	// dmemHookInstallPath is where the dmem-hook binary must be installed on
-	// the HOST (OCI hooks run on the host, outside the workload's mount
-	// namespace). It lives under /run (tmpfs) because it is a runtime artifact
-	// the driver DaemonSet installs at startup — ephemeral, re-created each
-	// boot — not persistent add-on software (which is what /opt is for).
-	// Deployment places cmd/dmem-hook's output there via a hostPath volume
-	// (e.g. an init container copying /usr/bin/dmem-hook to /run/amd-gpu/).
-	dmemHookInstallPath = "/run/amd-gpu/dmem-hook"
+	// dmemHookSourcePath is where the dmem-hook binary ships in the driver image;
+	// dmemHookInstallPath is where it must be on the HOST for the CDI createRuntime
+	// hook to exec it (OCI hooks run on the host, outside the workload's mount
+	// namespace). The install path is under the driver's own /var/run/cdi hostPath
+	// (the only writable /run mount the DaemonSet has), and /run is tmpfs (cleared
+	// each boot), so installDmemHook copies the binary there at every plugin
+	// start — self-contained and it survives reboots.
+	dmemHookSourcePath  = "/usr/bin/dmem-hook"
+	dmemHookInstallPath = "/run/cdi/dmem-hook"
 
 	// hookEnvPCIBDF / hookEnvMemBytes are the env contract between this
 	// driver and cmd/dmem-hook; they must match cmd/dmem-hook's envPCIBDF /
@@ -239,13 +242,44 @@ func buildGPUIndexByPCI(allocatable AllocatableDevices) map[string]int {
 	return byPCI
 }
 
-// checkDmemPrereqs logs loud, early warnings when the node is not ready for
-// the dmem cap path: without the kernel dmem controller or without the hook
-// binary installed on the host, every GPU container start would fail at its
-// createRuntime hook. Surfacing it once here at plugin startup beats an
-// outage discovered per-pod. Non-fatal by design: the plugin must still serve
-// non-dmem nodes (where no cap is emitted and the hook is the only failure).
+// installDmemHook copies the dmem-hook binary from the driver image
+// (dmemHookSourcePath) onto the host at dmemHookInstallPath, so the CDI
+// createRuntime hook can exec it. /run is tmpfs (cleared each boot), so this
+// runs at every plugin start and makes the hook survive reboots without any
+// DaemonSet init container. Idempotent: it overwrites only when the source
+// differs, and the write is atomic (tmp + rename).
+func installDmemHook() error {
+	src, err := os.ReadFile(dmemHookSourcePath)
+	if err != nil {
+		return fmt.Errorf("read hook source %s: %w", dmemHookSourcePath, err)
+	}
+	if dst, err := os.ReadFile(dmemHookInstallPath); err == nil && bytes.Equal(dst, src) {
+		return nil // already installed and current
+	}
+	if err := os.MkdirAll(filepath.Dir(dmemHookInstallPath), 0o755); err != nil {
+		return fmt.Errorf("mkdir hook dir: %w", err)
+	}
+	tmp := dmemHookInstallPath + ".tmp"
+	if err := os.WriteFile(tmp, src, 0o755); err != nil {
+		return fmt.Errorf("write hook %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, dmemHookInstallPath); err != nil {
+		return fmt.Errorf("install hook %s: %w", dmemHookInstallPath, err)
+	}
+	klog.Infof("installed dmem-hook %s -> %s", dmemHookSourcePath, dmemHookInstallPath)
+	return nil
+}
+
+// checkDmemPrereqs installs the dmem-hook binary then logs loud, early warnings
+// when the node is not ready for the dmem cap path: without the kernel dmem
+// controller or without the hook binary on the host, every GPU container start
+// would fail at its createRuntime hook. Surfacing it once here at plugin startup
+// beats an outage discovered per-pod. Non-fatal by design: the plugin must still
+// serve non-dmem nodes (where no cap is emitted and the hook is the only failure).
 func checkDmemPrereqs() {
+	if err := installDmemHook(); err != nil {
+		klog.Errorf("dmem-hook install failed (GPU containers needing a VRAM cap will fail at their createRuntime hook): %v", err)
+	}
 	const (
 		cgroupControllers = "/sys/fs/cgroup/cgroup.controllers"
 	)
