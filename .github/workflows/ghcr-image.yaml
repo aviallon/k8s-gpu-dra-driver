@@ -1,0 +1,103 @@
+name: GHCR Image
+
+# CI + image pipeline for the fork: run go vet/test, then build + push the driver
+# image (including the dmem-hook OCI createRuntime hook) to GitHub Container
+# Registry automatically. Uses the built-in GITHUB_TOKEN, so no registry secrets
+# are required. This is the fork's CI; the upstream ROCm-gated image.yaml
+# (docker.io/amdpsdo + DockerHub secrets) does not run here.
+#
+# The image is what deploys the fractional-GPU enforcement: gpu-kubeletplugin
+# emits the CDI createRuntime hook + HSA_CU_MASK, and dmem-hook (installed to the
+# host at /opt/amd-gpu/dmem-hook by the DaemonSet) writes the kernel dmem VRAM cap.
+
+on:
+  push:
+    branches:
+      - develop
+      - main
+      - dmem-cu-mask
+      - 'release-v*'
+  pull_request:
+    branches:
+      - develop
+      - main
+      - 'release-v*'
+  workflow_dispatch:
+
+# One build per ref at a time; do not cancel in-flight image pushes.
+concurrency:
+  group: ghcr-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Vet & Test
+    runs-on: ubuntu-latest
+    env:
+      # Match the build (Makefile cmds): CGO on, unresolved symbols (amd_smi is
+      # dlopen'd at runtime, not linked) ignored so vet/test link without libs.
+      CGO_ENABLED: 1
+      CGO_LDFLAGS_ALLOW: '-Wl,--unresolved-symbols=ignore-in-object-files'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: go vet
+        run: go vet ./...
+      - name: go test
+        run: go test ./...
+
+  build-push:
+    name: Build & Push to GHCR
+    needs: test
+    # Only publish images from branch pushes (not PRs) and only from this fork.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Derive lowercase image name + tags (GHCR requires lowercase).
+      - name: Image metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          SHA_SHORT="$(echo '${{ github.sha }}' | cut -c1-7)"
+          BRANCH="${GITHUB_REF_NAME}"
+          {
+            echo "image=${IMAGE}"
+            echo "tags=${IMAGE}:latest,${IMAGE}:${BRANCH},${IMAGE}:sha-${SHA_SHORT}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: deployments/container/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: |
+            GOLANG_VERSION=1.27.2
+          # Cache layers across runs to keep the ROCm/Go build fast.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Image pushed
+        run: echo "Pushed ${{ steps.meta.outputs.tags }}"
