@@ -89,13 +89,36 @@ func (d *AmdGpuInfo) GetDevice() resourceapi.Device {
 	if d.pcieRootAttr.Name != "" {
 		attributes[d.pcieRootAttr.Name] = d.pcieRootAttr.Value
 	}
+	memFull := *resource.NewQuantity(int64(d.MemoryBytes), resource.BinarySI)
+	cuFull := *resource.NewQuantity(int64(d.ComputeUnits), resource.DecimalSI)
+	oneGi := *resource.NewQuantity(1<<30, resource.BinarySI)
+	one := *resource.NewQuantity(1, resource.DecimalSI)
 	return resourceapi.Device{
 		Name:       d.CanonicalName(),
 		Attributes: attributes,
+		// Multi-allocatable (DRA Consumable Capacity): independent claims may
+		// take fractions of this GPU. The request policy's Default is the WHOLE
+		// device, so a request with no capacity entry (e.g. amd.com/gpu, vLLM)
+		// consumes 100% and stays exclusive; an explicit fraction is what splits
+		// the GPU. The driver's runtime edits (HSA_CU_MASK + dmem cap) then derive
+		// from the recorded ConsumedCapacity.
+		AllowMultipleAllocations: ptr.To(true),
 		Capacity: map[resourceapi.QualifiedName]resourceapi.DeviceCapacity{
-			"memory":       {Value: *resource.NewQuantity(int64(d.MemoryBytes), resource.BinarySI)},
-			"computeUnits": {Value: *resource.NewQuantity(int64(d.ComputeUnits), resource.BinarySI)},
-			"simdUnits":    {Value: *resource.NewQuantity(int64(d.SimdUnits), resource.BinarySI)},
+			"memory": {
+				Value: memFull,
+				RequestPolicy: &resourceapi.CapacityRequestPolicy{
+					Default:    &memFull,
+					ValidRange: &resourceapi.CapacityRequestPolicyRange{Min: &oneGi, Max: &memFull, Step: &oneGi},
+				},
+			},
+			"computeUnits": {
+				Value: cuFull,
+				RequestPolicy: &resourceapi.CapacityRequestPolicy{
+					Default:    &cuFull,
+					ValidRange: &resourceapi.CapacityRequestPolicyRange{Min: &one, Max: &cuFull, Step: &one},
+				},
+			},
+			"simdUnits": {Value: *resource.NewQuantity(int64(d.SimdUnits), resource.BinarySI)},
 		},
 	}
 }
