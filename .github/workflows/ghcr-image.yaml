@@ -34,10 +34,13 @@ jobs:
     name: Vet & Test
     runs-on: ubuntu-latest
     env:
-      # Match the build (Makefile cmds): CGO on, unresolved symbols (amd_smi is
-      # dlopen'd at runtime, not linked) ignored so vet/test link without libs.
+      # Match the build (Makefile cmds): CGO on, unresolved symbols ignored so
+      # vet/test link without amd_smi present at link time. The test binaries do
+      # need libamd_smi.so.27 at runtime, and it ships in-repo, so point
+      # LD_LIBRARY_PATH there.
       CGO_ENABLED: 1
       CGO_LDFLAGS_ALLOW: '-Wl,--unresolved-symbols=ignore-in-object-files'
+      LD_LIBRARY_PATH: ${{ github.workspace }}/third_party/amd_smi/lib
     steps:
       - name: Checkout
         uses: actions/checkout@v4
