@@ -68,7 +68,7 @@ COPY --from=build /build/third_party/amd_smi/lib/libdrm*.so* /usr/lib64/
 COPY --from=build /artifacts/gpu-kubeletplugin /usr/bin/gpu-kubeletplugin
 COPY --from=build /artifacts/webhook           /usr/bin/webhook
 # dmem-hook is an OCI createRuntime hook that the DaemonSet installs onto the
-# HOST at /opt/amd-gpu/dmem-hook (CDI hooks run on the host, so their path is a
+# HOST at /run/amd-gpu/dmem-hook (CDI hooks run on the host, so their path is a
 # host path). Ship it in the image so the DaemonSet init container can copy it
 # there; it enforces the per-pod VRAM cap via the kernel dmem controller.
 COPY --from=build /artifacts/dmem-hook          /usr/bin/dmem-hook

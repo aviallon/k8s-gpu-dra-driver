@@ -111,7 +111,7 @@ func TestBuildContainerRuntimeEdits(t *testing.T) {
 
 	require.Len(t, hooks, 1)
 	assert.Equal(t, "createRuntime", hooks[0].HookName)
-	assert.Equal(t, "/opt/amd-gpu/dmem-hook", hooks[0].Path)
+	assert.Equal(t, "/run/amd-gpu/dmem-hook", hooks[0].Path)
 	assert.Equal(t, []string{
 		"AMD_GPU_PCI_BDF=0000:e3:00.0",
 		"AMD_GPU_MEM_BYTES=8589934592",
@@ -167,7 +167,7 @@ func TestCreateClaimSpecFileCarriesRuntimeEdits(t *testing.T) {
 	assert.Contains(t, edits.Env, "HSA_CU_MASK=0:0-51")
 	require.Len(t, edits.Hooks, 1)
 	assert.Equal(t, "createRuntime", edits.Hooks[0].HookName)
-	assert.Equal(t, "/opt/amd-gpu/dmem-hook", edits.Hooks[0].Path)
+	assert.Equal(t, "/run/amd-gpu/dmem-hook", edits.Hooks[0].Path)
 	assert.Equal(t, []string{
 		"AMD_GPU_PCI_BDF=0000:e3:00.0",
 		"AMD_GPU_MEM_BYTES=8589934592",

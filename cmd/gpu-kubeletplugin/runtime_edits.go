@@ -43,9 +43,12 @@ import (
 const (
 	// dmemHookInstallPath is where the dmem-hook binary must be installed on
 	// the HOST (OCI hooks run on the host, outside the workload's mount
-	// namespace). Deployment must place cmd/dmem-hook's output there, e.g.
-	// through the driver DaemonSet with a hostPath volume.
-	dmemHookInstallPath = "/opt/amd-gpu/dmem-hook"
+	// namespace). It lives under /run (tmpfs) because it is a runtime artifact
+	// the driver DaemonSet installs at startup — ephemeral, re-created each
+	// boot — not persistent add-on software (which is what /opt is for).
+	// Deployment places cmd/dmem-hook's output there via a hostPath volume
+	// (e.g. an init container copying /usr/bin/dmem-hook to /run/amd-gpu/).
+	dmemHookInstallPath = "/run/amd-gpu/dmem-hook"
 
 	// hookEnvPCIBDF / hookEnvMemBytes are the env contract between this
 	// driver and cmd/dmem-hook; they must match cmd/dmem-hook's envPCIBDF /
