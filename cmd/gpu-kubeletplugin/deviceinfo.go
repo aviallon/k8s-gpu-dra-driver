@@ -119,7 +119,12 @@ func (d *AmdGpuInfo) GetDevice() resourceapi.Device {
 					ValidRange: &resourceapi.CapacityRequestPolicyRange{Min: &one, Max: &cuFull, Step: &one},
 				},
 			},
-			"simdUnits": {Value: *resource.NewQuantity(int64(d.SimdUnits), resource.BinarySI)},
+			// NOTE: no simdUnits here on purpose. A capacity key that a request
+			// does not carry is charged at its full value (no requestPolicy), which
+			// would consume all 416 SIMDs per share and cap the GPU at ONE share.
+			// simdUnits is proportional to computeUnits and is not used for
+			// enforcement, so we do not advertise it; a request then covers every
+			// advertised key (memory + computeUnits) and shares add up correctly.
 		},
 	}
 }
