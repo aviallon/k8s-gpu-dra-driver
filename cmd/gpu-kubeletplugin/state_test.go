@@ -33,16 +33,23 @@ limitations under the License.
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/ROCm/k8s-gpu-dra-driver/pkg/consts"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	resourceapi "k8s.io/api/resource/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	drapbv1 "k8s.io/kubelet/pkg/apis/dra/v1beta1"
+	"k8s.io/kubernetes/pkg/kubelet/checkpointmanager"
+
+	cdiapi "tags.cncf.io/container-device-interface/pkg/cdi"
+	cdispec "tags.cncf.io/container-device-interface/specs-go"
 )
 
 func TestRestoreFromVfio(t *testing.T) {
@@ -175,6 +182,140 @@ func TestPreparedDevicesGetDevices(t *testing.T) {
 			assert.Equal(t, test.expected, devices)
 		})
 	}
+}
+
+// The per-claim CDI spec files live in --cdi-root (/var/run/cdi in production),
+// a tmpfs, while the checkpoint is on disk and survives a reboot. After a reboot
+// kubelet restores its state with the CDI device IDs it already computed and
+// never calls Prepare again, so the plugin must rewrite those specs out of the
+// checkpoint at startup — otherwise every container of the claim fails with
+// "unresolvable CDI devices" and recreating the pods or the DaemonSet does not
+// help.
+func TestRestoreCheckpointStateRewritesClaimSpecs(t *testing.T) {
+	const claimUID = "claim-uid-1"
+
+	cdiRoot := t.TempDir()
+	pluginsDir := t.TempDir()
+
+	handler, err := NewCDIHandler(&Config{flags: &Flags{cdiRoot: cdiRoot, nodeName: "node-1"}})
+	require.NoError(t, err)
+
+	env, hooks := buildContainerRuntimeEdits("0000:e3:00.0", "0:0-51", 8<<30)
+	slot := 1
+	device := &PreparedDevice{
+		Device: drapbv1.Device{
+			RequestNames: []string{"req-0"},
+			PoolName:     "node-1",
+			DeviceName:   "gpu-0-128",
+		},
+		ContainerEdits: &cdiapi.ContainerEdits{ContainerEdits: &cdispec.ContainerEdits{
+			DeviceNodes: []*cdispec.DeviceNode{{
+				Path:        "/dev/dri/renderD128",
+				HostPath:    "/dev/dri/renderD128",
+				Type:        "c",
+				Major:       226,
+				Minor:       128,
+				Permissions: "rwm",
+			}},
+			Env:   env,
+			Hooks: hooks,
+		}},
+		// A partition slot makes the CDI device name carry the slot, which is the
+		// case a synthetic-partition claim needs restored after a reboot.
+		PartitionSlot: &slot,
+	}
+	// What Prepare recorded: after a restart the kubelet asks for exactly these IDs.
+	device.CdiDeviceIds = handler.GetClaimDevices(claimUID, []*PreparedDevice{device})
+
+	checkpoint := newCheckpoint()
+	checkpoint.V1.PreparedClaims[claimUID] = PreparedDevices{device}
+	// A claim recorded without devices must not stop the plugin from starting:
+	// CDI rejects an empty spec, and Prepare re-drives such an entry itself.
+	checkpoint.V1.PreparedClaims["claim-without-devices"] = nil
+	manager, err := checkpointmanager.NewCheckpointManager(pluginsDir)
+	require.NoError(t, err)
+	require.NoError(t, manager.CreateCheckpoint(DriverPluginCheckpointFile, checkpoint))
+
+	// A fresh boot: the checkpoint survived, the tmpfs-backed CDI root is empty.
+	specPath := filepath.Join(cdiRoot, cdiapi.GenerateTransientSpecName(cdiVendor, cdiClass, claimUID)+".yaml")
+	_, err = os.Stat(specPath)
+	require.True(t, os.IsNotExist(err), "the claim spec must be absent before the plugin starts, as after a reboot")
+
+	state := &DeviceState{cdi: handler, checkpointManager: manager}
+	require.NoError(t, state.restoreCheckpointState())
+
+	regenerated, err := cdiapi.ReadSpec(specPath, 0)
+	require.NoError(t, err, "the claim spec file must be written back at startup")
+	require.Len(t, regenerated.Devices, 1)
+	assert.Equal(t, claimUID+"-gpu-0-128-slot1", regenerated.Devices[0].Name)
+	assert.Equal(t, []string{"k8s.gpu.amd.com/gpu=common", "k8s.gpu.amd.com/gpu=" + claimUID + "-gpu-0-128-slot1"}, device.CdiDeviceIds,
+		"the regenerated name must be the one the checkpoint records, or kubelet asks for a device the spec does not declare")
+
+	edits := regenerated.Devices[0].ContainerEdits
+	assert.Contains(t, edits.Env, "HSA_CU_MASK=0:0-51")
+	require.Len(t, edits.DeviceNodes, 1)
+	assert.Equal(t, int64(226), edits.DeviceNodes[0].Major)
+	assert.Equal(t, int64(128), edits.DeviceNodes[0].Minor)
+	require.Len(t, edits.Hooks, 1)
+	assert.Equal(t, "/run/cdi/dmem-hook", edits.Hooks[0].Path)
+	assert.Contains(t, edits.Hooks[0].Env, "AMD_GPU_PCI_BDF=0000:e3:00.0")
+	assert.Contains(t, edits.Hooks[0].Env, "AMD_GPU_MEM_BYTES=8589934592")
+
+	// A plain plugin restart rewrites the same bytes, so the CDI root is unchanged.
+	first, err := os.ReadFile(specPath)
+	require.NoError(t, err)
+	require.NoError(t, state.restoreCheckpointState())
+	second, err := os.ReadFile(specPath)
+	require.NoError(t, err)
+	assert.Equal(t, string(first), string(second), "restoring an already-correct CDI root must be a no-op")
+
+	// A further reboot wipes the root again; the next start must still recover it.
+	require.NoError(t, os.Remove(specPath))
+	require.NoError(t, state.restoreCheckpointState())
+	third, err := os.ReadFile(specPath)
+	require.NoError(t, err)
+	assert.Equal(t, string(first), string(third))
+}
+
+// The restore above is only a fix if startup actually calls it. This drives the
+// real NewDeviceState entry point with a checkpoint already on disk, which is the
+// only place the wiring can be observed (a missing call there leaves every other
+// test green).
+func TestNewDeviceStateRestoresClaimSpecsFromCheckpoint(t *testing.T) {
+	const (
+		nodeName = "node-1"
+		claimUID = "claim-uid-1"
+	)
+
+	cdiRoot := t.TempDir()
+	pluginsDir := t.TempDir()
+
+	checkpoint := newCheckpoint()
+	checkpoint.V1.PreparedClaims[claimUID] = PreparedDevices{{
+		Device: drapbv1.Device{
+			RequestNames: []string{"req-0"},
+			PoolName:     nodeName,
+			DeviceName:   "gpu-0-128",
+		},
+		ContainerEdits: &cdiapi.ContainerEdits{ContainerEdits: &cdispec.ContainerEdits{
+			Env: []string{"HSA_CU_MASK=0:0-51"},
+		}},
+	}}
+	manager, err := checkpointmanager.NewCheckpointManager(filepath.Join(pluginsDir, consts.DriverName))
+	require.NoError(t, err)
+	require.NoError(t, manager.CreateCheckpoint(DriverPluginCheckpointFile, checkpoint))
+
+	state, err := NewDeviceState(&Config{flags: &Flags{
+		cdiRoot:                     cdiRoot,
+		nodeName:                    nodeName,
+		kubeletPluginsDirectoryPath: pluginsDir,
+	}})
+	require.NoError(t, err)
+	require.NotNil(t, state)
+
+	specPath := filepath.Join(cdiRoot, cdiapi.GenerateTransientSpecName(cdiVendor, cdiClass, claimUID)+".yaml")
+	_, err = os.Stat(specPath)
+	assert.NoError(t, err, "NewDeviceState must regenerate the checkpointed claims' CDI specs")
 }
 
 // TestPartitionSharesForClaim_DriverAndPoolMismatch guards the identity check

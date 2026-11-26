@@ -185,20 +185,8 @@ func NewDeviceState(config *Config) (*DeviceState, error) {
 	}
 
 	if checkpointExists {
-		// Recover partition state from checkpoint if synthetic-partition is enabled
-		if autoPartition && state.partitionState != nil {
-			checkpoint := newCheckpoint()
-			if err := state.checkpointManager.GetCheckpoint(DriverPluginCheckpointFile, checkpoint); err != nil {
-				klog.Warningf("Failed to read checkpoint for partition state recovery: %v", err)
-			} else {
-				state.partitionState.RecoverFromCheckpoint(
-					checkpoint.V1.ActiveMemoryMode,
-					checkpoint.V1.GPUComputeModes,
-					checkpoint.V1.MemoryReload,
-					checkpoint.V1.PreparedClaims,
-					checkpoint.V1.AssignedSlots,
-				)
-			}
+		if err := state.restoreCheckpointState(); err != nil {
+			return nil, err
 		}
 		return state, nil
 	}
@@ -209,6 +197,46 @@ func NewDeviceState(config *Config) (*DeviceState, error) {
 	}
 
 	return state, nil
+}
+
+// restoreCheckpointState rebuilds the state this plugin owns OUTSIDE the
+// checkpoint from the checkpoint itself: the per-claim CDI spec files (a tmpfs,
+// see CDIHandler.RegenerateClaimSpecFiles) and, in synthetic-partition mode, the
+// partition reservations.
+//
+// It runs before the plugin registers with the kubelet, so no container can be
+// created while the CDI root is still incomplete. A checkpoint that cannot be
+// read is fatal here rather than a warning: kubelet's stored CDI device IDs and
+// the partition reservations both come from it, and every later Prepare would
+// fail on the same read anyway.
+//
+// Note for whoever meets that failure: deleting the checkpoint does NOT recover
+// the node. Kubelet still holds the prepared claims in its dra_manager_state and
+// will never Prepare them again, so their specs would never come back and
+// nothing would even fail loudly. Delete the affected pods/claims instead, so
+// kubelet Unprepares and Prepares them anew.
+func (s *DeviceState) restoreCheckpointState() error {
+	checkpoint := newCheckpoint()
+	if err := s.checkpointManager.GetCheckpoint(DriverPluginCheckpointFile, checkpoint); err != nil {
+		return fmt.Errorf("unable to read checkpoint: %w", err)
+	}
+
+	if err := s.cdi.RegenerateClaimSpecFiles(checkpoint.V1.PreparedClaims); err != nil {
+		return fmt.Errorf("unable to regenerate CDI spec files for prepared claims: %w", err)
+	}
+
+	// Recover partition state from checkpoint if synthetic-partition is enabled
+	if s.syntheticPartition && s.partitionState != nil {
+		s.partitionState.RecoverFromCheckpoint(
+			checkpoint.V1.ActiveMemoryMode,
+			checkpoint.V1.GPUComputeModes,
+			checkpoint.V1.MemoryReload,
+			checkpoint.V1.PreparedClaims,
+			checkpoint.V1.AssignedSlots,
+		)
+	}
+
+	return nil
 }
 
 func (s *DeviceState) Prepare(claim *resourceapi.ResourceClaim) ([]*drapbv1.Device, error) {
